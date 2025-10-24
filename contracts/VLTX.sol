@@ -4,19 +4,28 @@ pragma solidity ^0.8.23;
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
+/**
+ * @title VAULTEX (VLTX)
+ * @notice BEP-20 style token for GemPad presale launches.
+ * - 0% fees at TGE (fees are togglable later, but hard-capped and lockable)
+ * - First-hour launch guards: maxTx, maxWallet (skip AMM), cooldown, sniperBlocks
+ * - No base liquidity required; GemPad finalization creates/locks LP
+ * - Auto-exclude AMM pair from fees/limits
+ * - One-way locks for fees and guards to calm investors
+ */
 contract VLTX is ERC20, Ownable {
     // ====== Constants / Config ======
     uint256 public constant MAX_SUPPLY = 1_000_000_000 ether; // 1B * 1e18
-    uint256 public constant FEE_DENOMINATOR = 10_000; // BPS denominator
-    uint256 public constant MAX_TOTAL_FEE_BPS = 300; // 3.00% hard cap (buy + sell each must be <= cap)
+    uint256 public constant FEE_DENOMINATOR = 10_000; // basis points denominator
+    uint256 public constant MAX_TOTAL_FEE_BPS = 300; // 3.00% hard cap per side
 
     // ====== Trading / Launch State ======
     bool public tradingEnabled;
     uint256 public launchBlock; // set at enableTrading()
-    uint8 public sniperBlocks; // 0..255 (e.g., 2-5)
-    uint16 public cooldownSeconds; // per-address cooldown window (e.g., 45)
+    uint8 public sniperBlocks; // e.g., 2–5 blocks
+    uint16 public cooldownSeconds; // e.g., 45 seconds
 
-    // Limits (set as absolute token amounts)
+    // Limits (absolute token amounts)
     uint256 public maxTxAmount; // e.g., 2% of supply
     uint256 public maxWalletAmount; // e.g., 3% of supply
 
@@ -25,11 +34,15 @@ contract VLTX is ERC20, Ownable {
     uint256 public sellFeeBps; // default 0
     address public feeRecipient; // treasury/multisig
 
+    // ====== Governance locks ======
+    bool public feesLocked; // once true, setFees can’t change
+    bool public guardsLocked; // once true, limits/cooldown/sniper can’t change
+
     // ====== Mappings ======
     mapping(address => bool) public isExcludedFromFees; // e.g., treasury, vesting, owner
-    mapping(address => bool) public isExcludedFromLimits; // bypass maxTx/maxWallet/cooldown/trading gate
+    mapping(address => bool) public isExcludedFromLimits; // gate/maxTx/maxWallet/cooldown bypass
     mapping(address => bool) public automatedMarketMakerPairs; // AMM pairs for buy/sell detection
-    mapping(address => uint256) private _lastTransferTimestamp; // address → last tx time (for cooldown)
+    mapping(address => uint256) private _lastTransferTimestamp; // cooldown tracker
 
     // ====== Events ======
     event TradingEnabled(uint256 indexed blockNumber);
@@ -54,6 +67,8 @@ contract VLTX is ERC20, Ownable {
     );
     event ExcludedFromFees(address indexed account, bool excluded);
     event ExcludedFromLimits(address indexed account, bool excluded);
+    event FeesLocked();
+    event GuardsLocked();
 
     // ====== Constructor ======
     constructor(
@@ -75,6 +90,10 @@ contract VLTX is ERC20, Ownable {
         _setLimits(_percentOfTotal(200), _percentOfTotal(300)); // 2% tx, 3% wallet
         _setCooldown(45);
         _setSniperBlocks(3);
+
+        // Fees start at 0% for TGE (explicitly)
+        buyFeeBps = 0;
+        sellFeeBps = 0;
     }
 
     // ====== Owner Setters ======
@@ -87,8 +106,23 @@ contract VLTX is ERC20, Ownable {
         emit TradingEnabled(launchBlock);
     }
 
+    /// @notice Lock fee configuration permanently (cannot be undone).
+    function lockFeesForever() external onlyOwner {
+        require(!feesLocked, "VLTX: fees already locked");
+        feesLocked = true;
+        emit FeesLocked();
+    }
+
+    /// @notice Lock guard parameters permanently (limits/cooldown/sniper).
+    function lockGuardsForever() external onlyOwner {
+        require(!guardsLocked, "VLTX: guards already locked");
+        guardsLocked = true;
+        emit GuardsLocked();
+    }
+
     /// @notice Set sniper blocks (e.g., 2-5) for initial blocks after enableTrading.
     function setSniperBlocks(uint8 _blocks) external onlyOwner {
+        require(!guardsLocked, "VLTX: guards locked");
         _setSniperBlocks(_blocks);
     }
 
@@ -100,6 +134,7 @@ contract VLTX is ERC20, Ownable {
 
     /// @notice Set per-address cooldown in seconds (e.g., 45). 0 disables cooldown.
     function setCooldown(uint16 secs) external onlyOwner {
+        require(!guardsLocked, "VLTX: guards locked");
         _setCooldown(secs);
     }
 
@@ -114,6 +149,7 @@ contract VLTX is ERC20, Ownable {
         uint256 newMaxTxAmount,
         uint256 newMaxWalletAmount
     ) external onlyOwner {
+        require(!guardsLocked, "VLTX: guards locked");
         _setLimits(newMaxTxAmount, newMaxWalletAmount);
     }
 
@@ -148,17 +184,27 @@ contract VLTX is ERC20, Ownable {
     }
 
     /// @notice Configure which addresses are AMM pairs (used to detect buy/sell).
+    /// Also auto-excludes the pair from fees/limits (best practice).
     function setAutomatedMarketMakerPair(
         address pair,
         bool isPair
     ) external onlyOwner {
         automatedMarketMakerPairs[pair] = isPair;
         emit AMMPairSet(pair, isPair);
+
+        // Auto-exclude AMM pair to avoid maxWallet/cooldown/fees interfering with trades
+        isExcludedFromLimits[pair] = true;
+        isExcludedFromFees[pair] = true;
+        emit ExcludedFromLimits(pair, true);
+        emit ExcludedFromFees(pair, true);
     }
 
     /// @notice Update fee recipient (treasury / multisig).
     function setFeeRecipient(address newRecipient) external onlyOwner {
-        require(newRecipient != address(0), "VLTX: zero addr");
+        require(
+            newRecipient != address(0) && newRecipient != address(this),
+            "VLTX: invalid recipient"
+        );
         address old = feeRecipient;
         feeRecipient = newRecipient;
         emit FeeRecipientUpdated(old, newRecipient);
@@ -166,6 +212,7 @@ contract VLTX is ERC20, Ownable {
 
     /// @notice Update buy/sell fees (BPS). Each must be <= MAX_TOTAL_FEE_BPS.
     function setFees(uint256 _buyBps, uint256 _sellBps) external onlyOwner {
+        require(!feesLocked, "VLTX: fees locked");
         require(_buyBps <= MAX_TOTAL_FEE_BPS, "VLTX: buy fee too high");
         require(_sellBps <= MAX_TOTAL_FEE_BPS, "VLTX: sell fee too high");
         uint256 oldBuy = buyFeeBps;
@@ -193,8 +240,27 @@ contract VLTX is ERC20, Ownable {
         emit ExcludedFromLimits(account, excluded);
     }
 
-    // ====== Transfer rules / fees ======
+    /// @notice Batch helpers (quality of life for setup)
+    function setExcludedFromFeesBatch(
+        address[] calldata accts,
+        bool excluded
+    ) external onlyOwner {
+        for (uint256 i; i < accts.length; i++) {
+            isExcludedFromFees[accts[i]] = excluded;
+            emit ExcludedFromFees(accts[i], excluded);
+        }
+    }
+    function setExcludedFromLimitsBatch(
+        address[] calldata accts,
+        bool excluded
+    ) external onlyOwner {
+        for (uint256 i; i < accts.length; i++) {
+            isExcludedFromLimits[accts[i]] = excluded;
+            emit ExcludedFromLimits(accts[i], excluded);
+        }
+    }
 
+    // ====== Transfer rules / fees ======
     function _update(
         address from,
         address to,
@@ -215,49 +281,47 @@ contract VLTX is ERC20, Ownable {
             isExcludedFromLimits[to]);
 
         if (limitsOn) {
-            // Sniper window can be used for stricter policies if desired.
+            // Sniper window marker (available for custom rules if needed)
             bool inSniperWindow = block.number <= (launchBlock + sniperBlocks);
+            inSniperWindow; // silence unused var (kept for future use)
 
             // MaxTx (skip if amount==0)
             if (amount > 0) {
                 require(amount <= maxTxAmount, "VLTX: > maxTx");
             }
 
-            // MaxWallet on recipient (post-fee incoming amount is <= amount, so using 'amount' is safe)
-            if (to != address(0)) {
+            // DO NOT enforce maxWallet on AMM pair (prevents sells from failing)
+            if (to != address(0) && !automatedMarketMakerPairs[to]) {
                 require(
                     balanceOf(to) + amount <= maxWalletAmount,
                     "VLTX: > maxWallet"
                 );
             }
 
-            // Cooldown (basic anti-bot pacing). Apply to buys and transfers; sells can be exempted if desired.
+            // Cooldown (apply to buys & transfers; sells throttle 'from')
             if (cooldownSeconds > 0) {
-                // For buys (from AMM) throttle 'to'; for transfers throttle both; for sells throttle 'from'
                 if (automatedMarketMakerPairs[from]) {
+                    // BUY: throttle recipient
                     _requireCooldownOk(to);
                     _lastTransferTimestamp[to] = block.timestamp;
                 } else if (automatedMarketMakerPairs[to]) {
+                    // SELL: throttle sender
                     _requireCooldownOk(from);
                     _lastTransferTimestamp[from] = block.timestamp;
                 } else {
+                    // TRANSFER: throttle both sides
                     _requireCooldownOk(from);
                     _requireCooldownOk(to);
                     _lastTransferTimestamp[from] = block.timestamp;
                     _lastTransferTimestamp[to] = block.timestamp;
                 }
             }
-
-            // Example stricter rule during sniper window (optional):
-            // require(!isContract(to), "VLTX: contracts blocked in sniper window");
-            // (Left commented to keep behavior predictable; add if required.)
-            inSniperWindow; // silence unused var if not used
         }
 
         // ===== Fee logic =====
         uint256 feeAmount = 0;
-
         bool takeFee = !(isExcludedFromFees[from] || isExcludedFromFees[to]);
+
         if (takeFee && amount > 0) {
             if (automatedMarketMakerPairs[from] && buyFeeBps > 0) {
                 // BUY: from AMM → user
@@ -269,7 +333,6 @@ contract VLTX is ERC20, Ownable {
         }
 
         if (feeAmount > 0) {
-            // send fee to recipient, then transfer remainder to 'to'
             super._update(from, feeRecipient, feeAmount);
             amount -= feeAmount;
         }
@@ -278,7 +341,6 @@ contract VLTX is ERC20, Ownable {
     }
 
     function _requireCooldownOk(address account) private view {
-        // Excluded handles were filtered earlier; here we assume we only call for non-excluded
         uint256 lastTs = _lastTransferTimestamp[account];
         require(block.timestamp >= lastTs + cooldownSeconds, "VLTX: cooldown");
     }
@@ -290,6 +352,7 @@ contract VLTX is ERC20, Ownable {
         uint256 maxTxBps,
         uint256 maxWalletBps
     ) external onlyOwner {
+        require(!guardsLocked, "VLTX: guards locked");
         _setLimits(_percentOfTotal(maxTxBps), _percentOfTotal(maxWalletBps));
     }
 
