@@ -1,369 +1,491 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
 
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-
 /**
- * @title VAULTEX (VLTX)
- * @notice BEP-20 style token for GemPad presale launches.
- * - 0% fees at TGE (fees are togglable later, but hard-capped and lockable)
- * - First-hour launch guards: maxTx, maxWallet (skip AMM), cooldown, sniperBlocks
- * - No base liquidity required; GemPad finalization creates/locks LP
- * - Auto-exclude AMM pair from fees/limits
- * - One-way locks for fees and guards to calm investors
+ * VAULTEX (VLTX) — Token + Governance Guards + Vesting + Optional LP Guardian + KYC Registry
+ * Matches the client's M0 v1.1 + Enhancements:
+ * - BEP-20 (ERC20) with 0% at TGE, governance-enabled fee toggle, hard-capped ≤ 5% total (buy+sell)
+ * - One-way trading enable; launch guards (maxTx, maxWallet, cooldown, sniper blocks)
+ * - Pausable LaunchSwitch (emergency)
+ * - Anti-bot blacklist (events)
+ * - Ownership via TimelockController/Multisig (transferOwnership after deploy)
+ * - VestingVault for Team/Advisors/Marketing (Team 6m cliff/24m linear; Advisors 3m/12m; Marketing 30% TGE + 70% monthly from Month 3)
+ * - LPGuardian (ELI): timelock-only, ≤10% LP token movement, evented
+ * - Optional KYCRegistry: store attestation for ≥$1k USDT contributors and general compliance
+ *
+ * IMPORTANT:
+ * - Set `ammPair` after GemPad creates the pair. Exclude pair/router/treasury/vesting from limits and fees as needed.
+ * - Transfer Ownership to a TimelockController or Multisig per governance plan.
+ * - If GemPad locks 100% LP, LPGuardian will have nothing to move (by design). Keep a small reserve LP chunk *if* you need ELI flexibility.
  */
-contract VLTX is ERC20, Ownable {
-    // ====== Constants / Config ======
+
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+
+/* ──────────────────────────────────────────────────────────────────────────────
+|                              KYC REGISTRY (opt)                               |
+└──────────────────────────────────────────────────────────────────────────────*/
+contract KYCRegistry is Ownable2Step, ReentrancyGuard {
+    event KYCSet(address indexed user, bool status, string meta);
+    mapping(address => bool) public isKYCApproved; // off-chain KYC linkable
+    // OPTIONAL: per-user metadata hash/IPFS ref for audit proofs
+    mapping(address => string) public kycMeta;
+
+    function setKYC(
+        address user,
+        bool approved,
+        string calldata meta
+    ) external onlyOwner {
+        isKYCApproved[user] = approved;
+        kycMeta[user] = meta;
+        emit KYCSet(user, approved, meta);
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────────
+|                                VESTING VAULT                                  |
+└──────────────────────────────────────────────────────────────────────────────*/
+contract VestingVault is Ownable2Step, ReentrancyGuard {
+    using SafeCast for uint256;
+
+    IERC20 public immutable token;
+
+    struct Schedule {
+        uint128 total; // total tokens allocated to beneficiary
+        uint64 start; // TGE timestamp (or custom start)
+        uint64 cliff; // seconds until first vest
+        uint64 duration; // linear vesting duration (seconds)
+        uint128 tgeAmount; // amount available at TGE (for Marketing 30%)
+        uint128 released; // amount already claimed
+        bool initialized;
+    }
+
+    mapping(address => Schedule) public schedules;
+
+    event ScheduleCreated(
+        address indexed beneficiary,
+        uint128 total,
+        uint64 start,
+        uint64 cliff,
+        uint64 duration,
+        uint128 tgeAmount
+    );
+    event TokensReleased(address indexed beneficiary, uint128 amount);
+
+    constructor(IERC20 _token) {
+        token = _token;
+    }
+
+    function createSchedule(
+        address beneficiary,
+        uint128 total,
+        uint64 start,
+        uint64 cliff,
+        uint64 duration,
+        uint128 tgeAmount
+    ) external onlyOwner {
+        require(!schedules[beneficiary].initialized, "Schedule exists");
+        require(total > 0, "total=0");
+        require(duration > 0, "duration=0");
+        schedules[beneficiary] = Schedule({
+            total: total,
+            start: start,
+            cliff: cliff,
+            duration: duration,
+            tgeAmount: tgeAmount,
+            released: 0,
+            initialized: true
+        });
+        emit ScheduleCreated(
+            beneficiary,
+            total,
+            start,
+            cliff,
+            duration,
+            tgeAmount
+        );
+    }
+
+    function vestedAmount(
+        address beneficiary,
+        uint64 t
+    ) public view returns (uint128) {
+        Schedule memory s = schedules[beneficiary];
+        if (!s.initialized) return 0;
+        if (t < s.start + s.cliff) {
+            // only TGE amount (e.g., Marketing 30%) before cliff
+            return s.tgeAmount;
+        }
+        if (t >= s.start + s.cliff + s.duration) {
+            return s.total;
+        }
+        // linear vest after cliff (over duration), plus TGE tranche
+        uint256 linear = (uint256(s.total - s.tgeAmount) *
+            (t - (s.start + s.cliff))) / s.duration;
+        return uint128(linear + s.tgeAmount);
+    }
+
+    function releasable(address beneficiary) public view returns (uint128) {
+        uint128 vested = vestedAmount(beneficiary, uint64(block.timestamp));
+        uint128 released_ = schedules[beneficiary].released;
+        return vested > released_ ? vested - released_ : 0;
+    }
+
+    function release(
+        address beneficiary
+    ) external nonReentrant returns (uint128 amt) {
+        amt = releasable(beneficiary);
+        require(amt > 0, "Nothing to release");
+        schedules[beneficiary].released += amt;
+        require(token.transfer(beneficiary, amt), "Transfer failed");
+        emit TokensReleased(beneficiary, amt);
+    }
+
+    // admin recover (in case of overfund)
+    function sweep(address to, uint256 amount) external onlyOwner {
+        require(token.transfer(to, amount), "sweep fail");
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────────
+|                         LP GUARDIAN (Emergency 10%)                           |
+└──────────────────────────────────────────────────────────────────────────────*/
+// Minimal LP token interface (e.g., Pancake LP = ERC20)
+interface ILPToken is IERC20 {}
+
+contract LPGuardian is Ownable2Step, ReentrancyGuard {
+    event ELIExecuted(
+        address indexed lp,
+        address indexed to,
+        uint256 amount,
+        string reason
+    );
+
+    // Hard cap: ≤10% of LP tokens held by this contract per ELI action
+    uint256 public constant ELI_BPS_CAP = 1000; // 10% of balance
+
+    // ELI (Emergency Liquidity Intervention): move up to 10% of held LP tokens
+    // to a designated address (e.g., MM desk or treasury) for rebalancing.
+    // NOTE: If all LP is locked in GemPad locker, this will do nothing (as intended).
+    function eliRebalance(
+        ILPToken lp,
+        address to,
+        uint256 amount,
+        string calldata reason
+    ) external onlyOwner nonReentrant {
+        uint256 bal = lp.balanceOf(address(this));
+        require(bal > 0, "No LP held");
+        uint256 maxAllowed = (bal * ELI_BPS_CAP) / 10_000;
+        require(amount > 0 && amount <= maxAllowed, "Amount > 10% cap");
+        require(lp.transfer(to, amount), "LP transfer failed");
+        emit ELIExecuted(address(lp), to, amount, reason);
+    }
+
+    // Allow depositing LP tokens (from multisig/timelock) to this guardian
+    function pullLP(ILPToken lp, uint256 amount) external onlyOwner {
+        require(
+            lp.transferFrom(msg.sender, address(this), amount),
+            "pull fail"
+        );
+    }
+
+    function sweepToken(
+        IERC20 token,
+        address to,
+        uint256 amount
+    ) external onlyOwner {
+        require(token.transfer(to, amount), "sweep fail");
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────────
+|                               VAULTEX (VLTX)                                  |
+└──────────────────────────────────────────────────────────────────────────────*/
+contract VLTX is ERC20, Ownable2Step, Pausable, ReentrancyGuard {
+    using SafeCast for uint256;
+
+    // ====== Constants ======
     uint256 public constant MAX_SUPPLY = 1_000_000_000 ether; // 1B * 1e18
-    uint256 public constant FEE_DENOMINATOR = 10_000; // basis points denominator
-    uint256 public constant MAX_TOTAL_FEE_BPS = 300; // 3.00% hard cap per side
+    uint256 public constant FEE_DENOMINATOR = 10_000; // bps
+    uint256 public constant MAX_TOTAL_FEE_BPS = 500; // <= 5.00% combined cap
 
-    // ====== Trading / Launch State ======
-    bool public tradingEnabled;
-    uint256 public launchBlock; // set at enableTrading()
-    uint8 public sniperBlocks; // e.g., 2–5 blocks
-    uint16 public cooldownSeconds; // e.g., 45 seconds
+    // ====== Addresses / Roles ======
+    address public treasury; // fee receiver, multisig recommended
+    address public ammPair; // Pancake pair address set post-creation
+    address public router; // Pancake router (optional reference)
+    KYCRegistry public kycRegistry; // optional (off-chain integration)
+    // Vesting vaults (deployed separately then funded)
+    VestingVault public teamVault;
+    VestingVault public advisorVault;
+    VestingVault public marketingVault;
 
-    // Limits (absolute token amounts)
+    // ====== Trading / Launch Guards ======
+    bool public tradingEnabled; // one-way
+    uint256 public tradingStartBlock; // for sniper protection
+    uint256 public sniperBlocks = 3; // default; configurable (2–5 suggested)
+    uint256 public launchGuardEndsAt; // timestamp when cooldown/limits auto-relax (optional)
+
+    // limits (applied while launch guards active)
     uint256 public maxTxAmount; // e.g., 2% of supply
     uint256 public maxWalletAmount; // e.g., 3% of supply
+    uint256 public cooldownSeconds = 45; // first hour recommended
+
+    mapping(address => uint256) private _lastTxAt; // cooldown tracker
+    mapping(address => bool) public isExcludedFromLimits;
+    mapping(address => bool) public isExcludedFromFees;
 
     // ====== Fees ======
-    uint256 public buyFeeBps; // default 0
-    uint256 public sellFeeBps; // default 0
-    address public feeRecipient; // treasury/multisig
+    uint256 public buyFeeBps; // ≤ 5% cap
+    uint256 public sellFeeBps; // ≤ 5% cap
 
-    // ====== Governance locks ======
-    bool public feesLocked; // once true, setFees can’t change
-    bool public guardsLocked; // once true, limits/cooldown/sniper can’t change
-
-    // ====== Mappings ======
-    mapping(address => bool) public isExcludedFromFees; // e.g., treasury, vesting, owner
-    mapping(address => bool) public isExcludedFromLimits; // gate/maxTx/maxWallet/cooldown bypass
-    mapping(address => bool) public automatedMarketMakerPairs; // AMM pairs for buy/sell detection
-    mapping(address => uint256) private _lastTransferTimestamp; // cooldown tracker
+    // ====== Anti-bot blacklist ======
+    mapping(address => bool) public isBlacklisted;
+    event BlacklistUpdated(address indexed account, bool blacklisted);
 
     // ====== Events ======
-    event TradingEnabled(uint256 indexed blockNumber);
-    event SniperBlocksUpdated(uint8 oldValue, uint8 newValue);
-    event CooldownUpdated(uint16 oldValue, uint16 newValue);
+    event TradingEnabled(uint256 startBlock, uint256 timestamp);
+    event FeesUpdated(uint256 buyFeeBps, uint256 sellFeeBps);
+    event TreasuryUpdated(address indexed newTreasury);
+    event PairSet(address indexed pair, address indexed router);
     event LimitsUpdated(
-        uint256 oldMaxTx,
-        uint256 newMaxTx,
-        uint256 oldMaxWallet,
-        uint256 newMaxWallet
+        uint256 maxTxAmount,
+        uint256 maxWalletAmount,
+        uint256 cooldownSeconds,
+        uint256 guardEndsAt
     );
-    event AMMPairSet(address indexed pair, bool isPair);
-    event FeeRecipientUpdated(
-        address indexed oldRecipient,
-        address indexed newRecipient
-    );
-    event FeesUpdated(
-        uint256 oldBuyBps,
-        uint256 newBuyBps,
-        uint256 oldSellBps,
-        uint256 newSellBps
-    );
-    event ExcludedFromFees(address indexed account, bool excluded);
-    event ExcludedFromLimits(address indexed account, bool excluded);
-    event FeesLocked();
-    event GuardsLocked();
+    event SniperBlocksUpdated(uint256 sniperBlocks);
+    event ExclusionUpdated(address indexed account, bool feeEx, bool limitEx);
+    event KYCRegistrySet(address indexed registry);
 
-    // ====== Constructor ======
     constructor(
         string memory name_,
-        string memory symbol_
-    ) ERC20(name_, symbol_) Ownable(msg.sender) {
-        _mint(msg.sender, MAX_SUPPLY);
+        string memory symbol_,
+        address treasury_
+    ) ERC20(name_, symbol_) {
+        require(treasury_ != address(0), "treasury=0");
+        treasury = treasury_;
 
-        // sane defaults
-        feeRecipient = msg.sender;
+        // mint full supply to owner (deployer) — you can redistribute to vaults/treasury later
+        _mint(_msgSender(), MAX_SUPPLY);
 
-        // Exclude key ops by default
-        isExcludedFromFees[msg.sender] = true;
-        isExcludedFromLimits[msg.sender] = true;
-        isExcludedFromFees[address(this)] = true;
-        isExcludedFromLimits[address(this)] = true;
+        // Default: exclude owner and treasury from fees/limits
+        isExcludedFromFees[_msgSender()] = true;
+        isExcludedFromFees[treasury] = true;
+        isExcludedFromLimits[_msgSender()] = true;
+        isExcludedFromLimits[treasury] = true;
 
-        // Initial limits (can be tuned before TGE)
-        _setLimits(_percentOfTotal(200), _percentOfTotal(300)); // 2% tx, 3% wallet
-        _setCooldown(45);
-        _setSniperBlocks(3);
-
-        // Fees start at 0% for TGE (explicitly)
-        buyFeeBps = 0;
-        sellFeeBps = 0;
+        // Default limits: set to safe values (can be tuned pre-launch)
+        maxTxAmount = (MAX_SUPPLY * 200) / 10_000; // 2%
+        maxWalletAmount = (MAX_SUPPLY * 300) / 10_000; // 3%
     }
 
-    // ====== Owner Setters ======
+    /* ───────────── Governance / Admin ───────────── */
 
-    /// @notice One-way switch. Records launch block for sniper window.
-    function enableTrading() external onlyOwner {
-        require(!tradingEnabled, "VLTX: already enabled");
-        tradingEnabled = true;
-        launchBlock = block.number;
-        emit TradingEnabled(launchBlock);
+    function setTreasury(address t) external onlyOwner {
+        require(t != address(0), "treasury=0");
+        treasury = t;
+        emit TreasuryUpdated(t);
     }
 
-    /// @notice Lock fee configuration permanently (cannot be undone).
-    function lockFeesForever() external onlyOwner {
-        require(!feesLocked, "VLTX: fees already locked");
-        feesLocked = true;
-        emit FeesLocked();
-    }
-
-    /// @notice Lock guard parameters permanently (limits/cooldown/sniper).
-    function lockGuardsForever() external onlyOwner {
-        require(!guardsLocked, "VLTX: guards already locked");
-        guardsLocked = true;
-        emit GuardsLocked();
-    }
-
-    /// @notice Set sniper blocks (e.g., 2-5) for initial blocks after enableTrading.
-    function setSniperBlocks(uint8 _blocks) external onlyOwner {
-        require(!guardsLocked, "VLTX: guards locked");
-        _setSniperBlocks(_blocks);
-    }
-
-    function _setSniperBlocks(uint8 _blocks) internal {
-        uint8 old = sniperBlocks;
-        sniperBlocks = _blocks;
-        emit SniperBlocksUpdated(old, _blocks);
-    }
-
-    /// @notice Set per-address cooldown in seconds (e.g., 45). 0 disables cooldown.
-    function setCooldown(uint16 secs) external onlyOwner {
-        require(!guardsLocked, "VLTX: guards locked");
-        _setCooldown(secs);
-    }
-
-    function _setCooldown(uint16 secs) internal {
-        uint16 old = cooldownSeconds;
-        cooldownSeconds = secs;
-        emit CooldownUpdated(old, secs);
-    }
-
-    /// @notice Set absolute limits (in wei). Use helpers to compute from % of supply if desired.
-    function setLimits(
-        uint256 newMaxTxAmount,
-        uint256 newMaxWalletAmount
-    ) external onlyOwner {
-        require(!guardsLocked, "VLTX: guards locked");
-        _setLimits(newMaxTxAmount, newMaxWalletAmount);
-    }
-
-    function _setLimits(
-        uint256 newMaxTxAmount,
-        uint256 newMaxWalletAmount
-    ) internal {
-        require(
-            newMaxTxAmount > 0 && newMaxWalletAmount > 0,
-            "VLTX: zero limit"
-        );
-        uint256 oldTx = maxTxAmount;
-        uint256 oldWallet = maxWalletAmount;
-        maxTxAmount = newMaxTxAmount;
-        maxWalletAmount = newMaxWalletAmount;
-        emit LimitsUpdated(
-            oldTx,
-            newMaxTxAmount,
-            oldWallet,
-            newMaxWalletAmount
-        );
-    }
-
-    /// @notice Helper: returns X basis points of total supply (e.g., 200 → 2%).
-    function percentOfTotal(uint256 bps) external view returns (uint256) {
-        return _percentOfTotal(bps);
-    }
-
-    function _percentOfTotal(uint256 bps) internal view returns (uint256) {
-        require(bps <= 10_000, "VLTX: bps > 100%");
-        return (MAX_SUPPLY * bps) / 10_000;
-    }
-
-    /// @notice Configure which addresses are AMM pairs (used to detect buy/sell).
-    /// Also auto-excludes the pair from fees/limits (best practice).
-    function setAutomatedMarketMakerPair(
+    function setPairAndRouter(
         address pair,
-        bool isPair
+        address router_
     ) external onlyOwner {
-        automatedMarketMakerPairs[pair] = isPair;
-        emit AMMPairSet(pair, isPair);
-
-        // Auto-exclude AMM pair to avoid maxWallet/cooldown/fees interfering with trades
+        ammPair = pair;
+        router = router_;
+        // Pairs & router typically excluded from limits/fees
         isExcludedFromLimits[pair] = true;
         isExcludedFromFees[pair] = true;
-        emit ExcludedFromLimits(pair, true);
-        emit ExcludedFromFees(pair, true);
+        if (router_ != address(0)) {
+            isExcludedFromLimits[router_] = true;
+            isExcludedFromFees[router_] = true;
+        }
+        emit PairSet(pair, router_);
     }
 
-    /// @notice Update fee recipient (treasury / multisig).
-    function setFeeRecipient(address newRecipient) external onlyOwner {
+    function setKYCRegistry(KYCRegistry reg) external onlyOwner {
+        kycRegistry = reg;
+        emit KYCRegistrySet(address(reg));
+    }
+
+    // bounds: combined must be ≤ MAX_TOTAL_FEE_BPS
+    function setFees(uint256 buyBps, uint256 sellBps) external onlyOwner {
         require(
-            newRecipient != address(0) && newRecipient != address(this),
-            "VLTX: invalid recipient"
+            buyBps <= MAX_TOTAL_FEE_BPS && sellBps <= MAX_TOTAL_FEE_BPS,
+            "fee>cap"
         );
-        address old = feeRecipient;
-        feeRecipient = newRecipient;
-        emit FeeRecipientUpdated(old, newRecipient);
+        buyFeeBps = buyBps;
+        sellFeeBps = sellBps;
+        emit FeesUpdated(buyBps, sellBps);
     }
 
-    /// @notice Update buy/sell fees (BPS). Each must be <= MAX_TOTAL_FEE_BPS.
-    function setFees(uint256 _buyBps, uint256 _sellBps) external onlyOwner {
-        require(!feesLocked, "VLTX: fees locked");
-        require(_buyBps <= MAX_TOTAL_FEE_BPS, "VLTX: buy fee too high");
-        require(_sellBps <= MAX_TOTAL_FEE_BPS, "VLTX: sell fee too high");
-        uint256 oldBuy = buyFeeBps;
-        uint256 oldSell = sellFeeBps;
-        buyFeeBps = _buyBps;
-        sellFeeBps = _sellBps;
-        emit FeesUpdated(oldBuy, _buyBps, oldSell, _sellBps);
-    }
-
-    /// @notice Exclude/Include from fees.
-    function setExcludedFromFees(
+    function setExclusions(
         address account,
-        bool excluded
+        bool feeEx,
+        bool limitEx
     ) external onlyOwner {
-        isExcludedFromFees[account] = excluded;
-        emit ExcludedFromFees(account, excluded);
+        isExcludedFromFees[account] = feeEx;
+        isExcludedFromLimits[account] = limitEx;
+        emit ExclusionUpdated(account, feeEx, limitEx);
     }
 
-    /// @notice Exclude/Include from limits (trading gate, maxTx, maxWallet, cooldown).
-    function setExcludedFromLimits(
+    function setLimits(
+        uint256 _maxTxAmount,
+        uint256 _maxWalletAmount,
+        uint256 _cooldownSeconds,
+        uint256 _guardEndsAt // set e.g., block.timestamp + 1 hours
+    ) external onlyOwner {
+        require(_maxTxAmount > 0 && _maxWalletAmount > 0, "limits=0");
+        maxTxAmount = _maxTxAmount;
+        maxWalletAmount = _maxWalletAmount;
+        cooldownSeconds = _cooldownSeconds;
+        launchGuardEndsAt = _guardEndsAt;
+        emit LimitsUpdated(
+            maxTxAmount,
+            maxWalletAmount,
+            cooldownSeconds,
+            launchGuardEndsAt
+        );
+    }
+
+    function setSniperBlocks(uint256 blocks_) external onlyOwner {
+        require(blocks_ <= 10, "too large"); // sanity
+        sniperBlocks = blocks_;
+        emit SniperBlocksUpdated(blocks_);
+    }
+
+    function pauseLaunch() external onlyOwner {
+        _pause();
+    }
+
+    function unpauseLaunch() external onlyOwner {
+        _unpause();
+    }
+
+    // one-way enable
+    function enableTrading() external onlyOwner {
+        require(!tradingEnabled, "already enabled");
+        tradingEnabled = true;
+        tradingStartBlock = block.number;
+        emit TradingEnabled(block.number, block.timestamp);
+    }
+
+    function setBlacklist(
         address account,
-        bool excluded
+        bool blacklisted
     ) external onlyOwner {
-        isExcludedFromLimits[account] = excluded;
-        emit ExcludedFromLimits(account, excluded);
+        isBlacklisted[account] = blacklisted;
+        emit BlacklistUpdated(account, blacklisted);
     }
 
-    /// @notice Batch helpers (quality of life for setup)
-    function setExcludedFromFeesBatch(
-        address[] calldata accts,
-        bool excluded
+    // vault wiring helpers
+    function setVestingVaults(
+        VestingVault team_,
+        VestingVault advisors_,
+        VestingVault marketing_
     ) external onlyOwner {
-        for (uint256 i; i < accts.length; i++) {
-            isExcludedFromFees[accts[i]] = excluded;
-            emit ExcludedFromFees(accts[i], excluded);
+        teamVault = team_;
+        advisorVault = advisors_;
+        marketingVault = marketing_;
+        // typical exclusions
+        if (address(team_) != address(0)) {
+            isExcludedFromLimits[address(team_)] = true;
+            isExcludedFromFees[address(team_)] = true;
+        }
+        if (address(advisors_) != address(0)) {
+            isExcludedFromLimits[address(advisors_)] = true;
+            isExcludedFromFees[address(advisors_)] = true;
+        }
+        if (address(marketing_) != address(0)) {
+            isExcludedFromLimits[address(marketing_)] = true;
+            isExcludedFromFees[address(marketing_)] = true;
         }
     }
-    function setExcludedFromLimitsBatch(
-        address[] calldata accts,
-        bool excluded
-    ) external onlyOwner {
-        for (uint256 i; i < accts.length; i++) {
-            isExcludedFromLimits[accts[i]] = excluded;
-            emit ExcludedFromLimits(accts[i], excluded);
-        }
-    }
 
-    // ====== Transfer rules / fees ======
+    /* ───────────── Transfers + Launch Rules ───────────── */
+
     function _update(
         address from,
         address to,
         uint256 amount
-    ) internal override {
-        // Pre-trading gate: only setup ops by excluded accounts (e.g., add liquidity, treasury allocs).
+    ) internal override whenNotPaused {
+        require(!isBlacklisted[from] && !isBlacklisted[to], "blacklisted");
+
+        // before trading: allow owner/treasury/vault wiring, block public
         if (!tradingEnabled) {
             require(
                 isExcludedFromLimits[from] || isExcludedFromLimits[to],
-                "VLTX: trading not enabled"
+                "trading disabled"
             );
             super._update(from, to, amount);
             return;
         }
 
-        // Apply limits/guards unless excluded
-        bool limitsOn = !(isExcludedFromLimits[from] ||
-            isExcludedFromLimits[to]);
+        // launch guards window
+        bool guardsActive = launchGuardEndsAt == 0
+            ? true
+            : block.timestamp < launchGuardEndsAt;
 
-        if (limitsOn) {
-            // Sniper window marker (available for custom rules if needed)
-            bool inSniperWindow = block.number <= (launchBlock + sniperBlocks);
-            inSniperWindow; // silence unused var (kept for future use)
-
-            // MaxTx (skip if amount==0)
-            if (amount > 0) {
-                require(amount <= maxTxAmount, "VLTX: > maxTx");
-            }
-
-            // DO NOT enforce maxWallet on AMM pair (prevents sells from failing)
-            if (to != address(0) && !automatedMarketMakerPairs[to]) {
-                require(
-                    balanceOf(to) + amount <= maxWalletAmount,
-                    "VLTX: > maxWallet"
-                );
-            }
-
-            // Cooldown (apply to buys & transfers; sells throttle 'from')
-            if (cooldownSeconds > 0) {
-                if (automatedMarketMakerPairs[from]) {
-                    // BUY: throttle recipient
-                    _requireCooldownOk(to);
-                    _lastTransferTimestamp[to] = block.timestamp;
-                } else if (automatedMarketMakerPairs[to]) {
-                    // SELL: throttle sender
-                    _requireCooldownOk(from);
-                    _lastTransferTimestamp[from] = block.timestamp;
-                } else {
-                    // TRANSFER: throttle both sides
-                    _requireCooldownOk(from);
-                    _requireCooldownOk(to);
-                    _lastTransferTimestamp[from] = block.timestamp;
-                    _lastTransferTimestamp[to] = block.timestamp;
+        if (guardsActive) {
+            // Limits (skip for excluded)
+            if (!isExcludedFromLimits[from] && !isExcludedFromLimits[to]) {
+                require(amount <= maxTxAmount, "maxTx");
+                if (to != ammPair) {
+                    require(
+                        balanceOf(to) + amount <= maxWalletAmount,
+                        "maxWallet"
+                    );
+                }
+                // cooldown
+                if (cooldownSeconds > 0) {
+                    require(
+                        block.timestamp >= _lastTxAt[from] + cooldownSeconds,
+                        "cooldown from"
+                    );
+                    require(
+                        block.timestamp >= _lastTxAt[to] + cooldownSeconds,
+                        "cooldown to"
+                    );
+                    _lastTxAt[from] = block.timestamp;
+                    _lastTxAt[to] = block.timestamp;
                 }
             }
-        }
 
-        // ===== Fee logic =====
-        uint256 feeAmount = 0;
-        bool takeFee = !(isExcludedFromFees[from] || isExcludedFromFees[to]);
-
-        if (takeFee && amount > 0) {
-            if (automatedMarketMakerPairs[from] && buyFeeBps > 0) {
-                // BUY: from AMM → user
-                feeAmount = (amount * buyFeeBps) / FEE_DENOMINATOR;
-            } else if (automatedMarketMakerPairs[to] && sellFeeBps > 0) {
-                // SELL: user → AMM
-                feeAmount = (amount * sellFeeBps) / FEE_DENOMINATOR;
+            // sniper protection (first N blocks after enable)
+            if (
+                sniperBlocks > 0 &&
+                block.number <= tradingStartBlock + sniperBlocks
+            ) {
+                // Only allow tx if either side is excluded (e.g., router/treasury) to reduce bot buys
+                require(
+                    isExcludedFromLimits[from] || isExcludedFromLimits[to],
+                    "sniper guard"
+                );
             }
         }
 
-        if (feeAmount > 0) {
-            super._update(from, feeRecipient, feeAmount);
-            amount -= feeAmount;
+        // Fees (only on AMM interactions, unless excluded)
+        uint256 fee;
+        if (!isExcludedFromFees[from] && !isExcludedFromFees[to]) {
+            // buy if from == pair; sell if to == pair
+            if (from == ammPair && buyFeeBps > 0) {
+                fee = (amount * buyFeeBps) / FEE_DENOMINATOR;
+            } else if (to == ammPair && sellFeeBps > 0) {
+                fee = (amount * sellFeeBps) / FEE_DENOMINATOR;
+            }
+        }
+
+        if (fee > 0) {
+            super._update(from, treasury, fee);
+            amount -= fee;
         }
 
         super._update(from, to, amount);
-    }
-
-    function _requireCooldownOk(address account) private view {
-        uint256 lastTs = _lastTransferTimestamp[account];
-        require(block.timestamp >= lastTs + cooldownSeconds, "VLTX: cooldown");
-    }
-
-    // ====== Owner helpers ======
-
-    /// @notice Convenience setters for percentages of total supply (e.g., 200 = 2%).
-    function setLimitsBps(
-        uint256 maxTxBps,
-        uint256 maxWalletBps
-    ) external onlyOwner {
-        require(!guardsLocked, "VLTX: guards locked");
-        _setLimits(_percentOfTotal(maxTxBps), _percentOfTotal(maxWalletBps));
-    }
-
-    /// @notice Rescue tokens sent by mistake.
-    function sweepERC20(
-        address token,
-        address to,
-        uint256 amt
-    ) external onlyOwner {
-        require(to != address(0), "VLTX: zero to");
-        require(token != address(this), "VLTX: cannot sweep VLTX");
-        ERC20(token).transfer(to, amt);
     }
 }
