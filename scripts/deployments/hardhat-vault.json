@@ -1,0 +1,6 @@
+{
+  "network": "hardhat",
+  "vault": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+  "token": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+  "owner": "0x9958A0E8f79f911d12fCa5A6b3EB6E55391311DB"
+}

@@ -1,7 +1,7 @@
 {
   "name": "vltx",
   "version": "1.0.0",
-  "description": "",
+  "description": "This project demonstrates a basic Hardhat use case. It comes with a sample contract, a test for that contract, and a Hardhat Ignition module that deploys that contract.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -12,13 +12,14 @@
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^6.1.0",
     "@nomicfoundation/hardhat-verify": "^2.1.1",
+    "@openzeppelin/contracts": "^5.4.0",
     "dotenv": "^16.4.5",
     "hardhat": "^2.26.3",
     "solhint": "^4.5.4",
     "ts-node": "^10.9.2",
     "typescript": "^5.5.4"
   },
-  "dependencies": {
-    "@openzeppelin/contracts": "^5.0.2"
+  "directories": {
+    "test": "test"
   }
 }
